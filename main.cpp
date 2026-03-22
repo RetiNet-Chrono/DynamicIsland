@@ -13,6 +13,9 @@
 #include <winrt/Windows.Media.Control.h>
 #include <winrt/Windows.System.h>
 
+#include <fstream>
+#include <cctype>
+
 using namespace winrt;
 using namespace Windows::Media::Control;
 
@@ -90,6 +93,60 @@ static bool g_hasMusic = false;
 static bool g_isPlaying = false;           // 当前是否正在播放
 static float g_waveAmplitudes[4] = { 0.3f, 0.5f, 0.7f, 0.4f };
 static float g_wavePhase = 0.0f;
+
+static HMENU g_hTrayMenu = NULL;
+
+static int g_userX = -1, g_userY = -1;          // 用户保存的窗口位置
+static BOOL g_isDraggingWindow = FALSE;         // 是否正在拖动窗口
+static POINT g_dragStartPt;                     // 拖动起点（屏幕坐标）
+static POINT g_windowStartPos;                  // 窗口起始位置
+
+void GetConfigPath(WCHAR* path, size_t size) {
+    GetModuleFileNameW(NULL, path, size);
+    WCHAR* lastSlash = wcsrchr(path, L'\\');
+    if (lastSlash) *(lastSlash + 1) = L'\0';
+    wcscat_s(path, size, L"config.json");
+}
+
+void LoadConfig() {
+    WCHAR path[MAX_PATH];
+    GetConfigPath(path, MAX_PATH);
+    std::ifstream file(path);
+    if (!file.is_open()) return;
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    file.close();
+    size_t xPos = content.find("\"x\":");
+    size_t yPos = content.find("\"y\":");
+    if (xPos != std::string::npos && yPos != std::string::npos) {
+        int x = 0, y = 0;
+        xPos = content.find(':', xPos) + 1;
+        while (xPos < content.size() && (content[xPos] == ' ' || content[xPos] == '\t')) xPos++;
+        if (xPos < content.size() && isdigit(content[xPos]))
+            x = std::stoi(content.substr(xPos));
+        yPos = content.find(':', yPos) + 1;
+        while (yPos < content.size() && (content[yPos] == ' ' || content[yPos] == '\t')) yPos++;
+        if (yPos < content.size() && isdigit(content[yPos]))
+            y = std::stoi(content.substr(yPos));
+        if (x != 0 || y != 0) { 
+            g_userX = x;
+            g_userY = y;
+        }
+    }
+}
+
+void SaveConfig() {
+    WCHAR path[MAX_PATH];
+    GetConfigPath(path, MAX_PATH);
+    std::ofstream file(path);
+    if (file.is_open()) {
+        file << "{\n";
+        file << "  \"x\": " << g_userX << ",\n";
+        file << "  \"y\": " << g_userY << "\n";
+        file << "}\n";
+        file.close();
+    }
+}
+
 
 void SetAutoStart() {
     /*自动注册自启动*/
@@ -231,7 +288,7 @@ void DrawMusicCard(HDC hdc, int w, const ColorTheme* theme) {
         return;
     }
 
-    // 1. 音频条（左侧）
+    // 1. 音频条
     int barStartX = cardRect.left + 8;
     int barStartY = cardRect.top + (CARD_HEIGHT - 20) / 2;
     int barWidth = 4;
@@ -271,7 +328,7 @@ void DrawMusicCard(HDC hdc, int w, const ColorTheme* theme) {
     DeleteObject(titleFont);
     DeleteObject(artistFont);
 
-    // 3. 播放/暂停按钮（右侧）
+    // 3. 播放/暂停按钮
     int btnSize = 32;
     int btnX = cardRect.right - btnSize - 8;
     int btnY = cardRect.top + (CARD_HEIGHT - btnSize) / 2;
@@ -344,7 +401,7 @@ void CopyClipItemToSystem(int index) {
     }
 }
 
-// ==================== HEX颜色检测 ====================
+// HEX颜色检测 
 BOOL IsHexColor(LPCWSTR str, COLORREF* outColor) {
     if (!str) return FALSE;
 
@@ -625,7 +682,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_lastPerfUpdate = GetTickCount();
 
         int x = (g_screenW - g_widthCollapsed) / 2;
-        SetWindowPos(hWnd, HWND_TOPMOST, x, MARGIN_TOP,
+        int y = MARGIN_TOP;
+        if (g_userX != -1 && g_userY != -1) {
+            x = g_userX;
+            y = g_userY;
+        }
+        SetWindowPos(hWnd, HWND_TOPMOST, x, y,
             g_widthCollapsed, HEIGHT_COLLAPSED, SWP_SHOWWINDOW);
 
         int cardBottom = GRID_GAP + TIME_HEIGHT + GRID_GAP + CARD_HEIGHT + GRID_GAP;
@@ -641,6 +703,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         SetTimer(hWnd, TIMER_ID, TIMER_INTERVAL, NULL);
 
+        LoadConfig();
+
         NOTIFYICONDATA nid = { sizeof(nid) };
         nid.hWnd = hWnd;
         nid.uID = ID_TRAY_ICON;
@@ -649,6 +713,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
         wcscpy_s(nid.szTip, L"DynamicIsland-Windows的灵动岛");
         Shell_NotifyIcon(NIM_ADD, &nid);
+        // 创建弹出菜单
+        g_hTrayMenu = CreatePopupMenu();
+        AppendMenuW(g_hTrayMenu, MF_STRING, 1001, L"退出程序");
+        AppendMenuW(g_hTrayMenu, MF_STRING, 1002, L"取消开机自启动");
 
         InitSMTC();
 
@@ -670,11 +738,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 WCHAR* pText = (WCHAR*)GlobalLock(hData);
                 if (pText && wcslen(pText) < 1000) {
                     AddToClipboardHistory(pText);
-                    if (!g_isExpanded && !g_winAnim.isActive && !g_isColorPicking) {
-                        WinAnimStart(&g_winAnim, hWnd, TRUE,
-                            g_widthExpanded, HEIGHT_EXPANDED,
-                            g_widthCollapsed, HEIGHT_COLLAPSED);
-                    }
                     InvalidateRect(hWnd, NULL, FALSE);
                 }
                 GlobalUnlock(hData);
@@ -716,7 +779,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         // 鼠标悬停检测
-        if (!g_isColorPicking) {
+        if (!g_isColorPicking && !g_isDraggingWindow) {
             POINT pt;
             GetCursorPos(&pt);
             RECT winRect;
@@ -739,47 +802,53 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         // 动画更新
-        BOOL animating = WinAnimUpdate(&g_winAnim, hWnd, g_screenW, MARGIN_TOP, ANIMATION_DURATION);
-        if (!animating && !g_winAnim.isActive && g_winAnim.startTime != 0) {
-            g_isExpanded = g_winAnim.isExpanding;
-            int finalW = g_isExpanded ? g_widthExpanded : g_widthCollapsed;
-            int finalH = g_isExpanded ? HEIGHT_EXPANDED : HEIGHT_COLLAPSED;
-            int finalX = (g_screenW - finalW) / 2;
-            SetWindowPos(hWnd, HWND_TOPMOST, finalX, MARGIN_TOP, finalW, finalH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        }
-        if (animating) InvalidateRect(hWnd, NULL, FALSE);
+        if (!g_isDraggingWindow) {
+            BOOL animating = WinAnimUpdate(&g_winAnim, hWnd, g_screenW, MARGIN_TOP, ANIMATION_DURATION);
+            if (animating) InvalidateRect(hWnd, NULL, FALSE);
 
-        // 按钮动画更新
-        if (g_isExpanded || g_winAnim.isActive) {
-            float old1 = g_btnColorPicker.animHover;
-            float old2 = g_btnTheme.animHover;
-            float old3 = g_btnKeepAwake.animHover;
-            float old4 = g_btnSettings.animHover;
+            // 按钮动画更新
+            if (g_isExpanded || g_winAnim.isActive) {
+                float old1 = g_btnColorPicker.animHover;
+                float old2 = g_btnTheme.animHover;
+                float old3 = g_btnKeepAwake.animHover;
+                float old4 = g_btnSettings.animHover;
 
-            BtnUpdate(&g_btnColorPicker);
-            BtnUpdate(&g_btnTheme);
-            BtnUpdate(&g_btnKeepAwake);
-            BtnUpdate(&g_btnSettings);
+                BtnUpdate(&g_btnColorPicker);
+                BtnUpdate(&g_btnTheme);
+                BtnUpdate(&g_btnKeepAwake);
+                BtnUpdate(&g_btnSettings);
 
-            // 同步主题按钮文字
-            BOOL isDark = IsSystemDarkMode();
-            const WCHAR* expectedText = isDark ? L"☀️明亮" : L"🌙暗黑";
-            if (wcscmp(g_btnTheme.text, expectedText) != 0) {
-                wcsncpy_s(g_btnTheme.text, MAX_BTN_TEXT, expectedText, _TRUNCATE);
-                InvalidateRect(hWnd, NULL, FALSE);
+                // 同步主题按钮文字
+                BOOL isDark = IsSystemDarkMode();
+                const WCHAR* expectedText = isDark ? L"☀️明亮" : L"🌙暗黑";
+                if (wcscmp(g_btnTheme.text, expectedText) != 0) {
+                    wcsncpy_s(g_btnTheme.text, MAX_BTN_TEXT, expectedText, _TRUNCATE);
+                    InvalidateRect(hWnd, NULL, FALSE);
+                }
+
+                // 同步常亮按钮状态
+                if (g_btnKeepAwake.isActive != g_isKeepAwake) {
+                    g_btnKeepAwake.isActive = g_isKeepAwake;
+                    InvalidateRect(hWnd, NULL, FALSE);
+                }
+
+                if (fabs(old1 - g_btnColorPicker.animHover) > 0.001f ||
+                    fabs(old2 - g_btnTheme.animHover) > 0.001f ||
+                    fabs(old3 - g_btnKeepAwake.animHover) > 0.001f ||
+                    fabs(old4 - g_btnSettings.animHover) > 0.001f) {
+                    InvalidateRect(hWnd, NULL, FALSE);
+                }
             }
 
-            // 同步常亮按钮状态
-            if (g_btnKeepAwake.isActive != g_isKeepAwake) {
-                g_btnKeepAwake.isActive = g_isKeepAwake;
-                InvalidateRect(hWnd, NULL, FALSE);
-            }
-
-            if (fabs(old1 - g_btnColorPicker.animHover) > 0.001f ||
-                fabs(old2 - g_btnTheme.animHover) > 0.001f ||
-                fabs(old3 - g_btnKeepAwake.animHover) > 0.001f ||
-                fabs(old4 - g_btnSettings.animHover) > 0.001f) {
-                InvalidateRect(hWnd, NULL, FALSE);
+            if (!animating && !g_winAnim.isActive && g_winAnim.startTime != 0) {
+                g_isExpanded = g_winAnim.isExpanding;
+                int finalW = g_isExpanded ? g_widthExpanded : g_widthCollapsed;
+                int finalH = g_isExpanded ? HEIGHT_EXPANDED : HEIGHT_COLLAPSED;
+                RECT rc;
+                GetWindowRect(hWnd, &rc);
+                SetWindowPos(hWnd, HWND_TOPMOST, rc.left, rc.top,
+                    finalW, finalH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                g_winAnim.startTime = 0;
             }
         }
         return 0;
@@ -955,6 +1024,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         POINT pt = { LOWORD(lParam), HIWORD(lParam) };
 
+        RECT rcClient;
+        GetClientRect(hWnd, &rcClient);
+        int halfW = rcClient.right / 2;
+        RECT rcTime = {
+            GRID_GAP, GRID_GAP,
+            halfW - GRID_GAP / 2,
+            GRID_GAP + TIME_HEIGHT
+        };
+        if (PtInRect(&rcTime, pt)) {
+            g_winAnim.isActive = FALSE;
+            g_winAnim.startTime = 0;
+
+            g_isDraggingWindow = TRUE;
+            SetCapture(hWnd);
+            ClientToScreen(hWnd, &pt);
+            g_dragStartPt = pt;
+            GetWindowRect(hWnd, &rcClient);
+            g_windowStartPos.x = rcClient.left;
+            g_windowStartPos.y = rcClient.top;
+            return 0;
+        }
+
         // 按钮点击检测
         if (BtnHitTest(&g_btnColorPicker, pt.x, pt.y)) {
             StartColorPicking();
@@ -1035,6 +1126,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_MOUSEMOVE:
         if (g_isColorPicking) return 0;
 
+        if (g_isDraggingWindow) {
+            POINT pt;
+            GetCursorPos(&pt);
+            int dx = pt.x - g_dragStartPt.x;
+            int dy = pt.y - g_dragStartPt.y;
+            SetWindowPos(hWnd, NULL,
+                g_windowStartPos.x + dx, g_windowStartPos.y + dy,
+                0, 0, SWP_NOSIZE | SWP_NOZORDER);
+            return 0;
+        }
+
         if (g_isExpanded) {
             POINT pt = { LOWORD(lParam), HIWORD(lParam) };
             BtnHandleMouse(&g_btnColorPicker, msg, pt.x, pt.y);
@@ -1045,6 +1147,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return DefWindowProc(hWnd, msg, wParam, lParam);
 
     case WM_LBUTTONUP:
+        if (g_isDraggingWindow) {
+            ReleaseCapture();
+            g_isDraggingWindow = FALSE;
+            RECT rc;
+            GetWindowRect(hWnd, &rc);
+            g_userX = rc.left;
+            g_userY = rc.top;
+            SaveConfig();
+            return 0;
+        }
         if (g_isExpanded && !g_isColorPicking) {
             POINT pt = { LOWORD(lParam), HIWORD(lParam) };
             if (BtnHandleMouse(&g_btnColorPicker, msg, pt.x, pt.y) ||
@@ -1077,6 +1189,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         nid.hWnd = hWnd;
         nid.uID = ID_TRAY_ICON;
         Shell_NotifyIcon(NIM_DELETE, &nid);
+
+        if (g_hTrayMenu) DestroyMenu(g_hTrayMenu);
         
         CleanupSMTC();
         PostQuitMessage(0);
@@ -1084,17 +1198,38 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_TRAYICON: {
-        if (lParam == WM_LBUTTONUP || lParam == WM_RBUTTONUP) {
-            if (IsWindowVisible(hWnd)) {
-                ShowWindow(hWnd, SW_HIDE);
-            }
-            else {
-                ShowWindow(hWnd, SW_SHOWNORMAL);
-                SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-            }
+        if (lParam == WM_RBUTTONUP) {
+            POINT pt;
+            GetCursorPos(&pt);
+            SetForegroundWindow(hWnd);
+            TrackPopupMenu(g_hTrayMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
+            PostMessage(hWnd, WM_NULL, 0, 0);
         }
         return 0;
+    }
+    case WM_COMMAND: {
+        int wmId = LOWORD(wParam);
+        switch (wmId) {
+        case 1001: { 
+            PostQuitMessage(0);
+            break;
+        }
+        case 1002: { // 取消开机自启动
+            HKEY hKey;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                RegDeleteValueW(hKey, L"RetiIsland");
+                RegCloseKey(hKey);
+                MessageBoxW(hWnd, L"已取消开机自启动，下次启动程序将重新启用。", L"提示", MB_OK | MB_ICONINFORMATION);
+            }
+            else {
+                MessageBoxW(hWnd, L"操作失败，请以管理员身份运行程序后重试。", L"错误", MB_OK | MB_ICONERROR);
+            }
+            break;
+        }
+        }
+        break;
     }
     }
 

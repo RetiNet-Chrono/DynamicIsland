@@ -299,6 +299,8 @@ typedef struct {
     DWORD startTime;
     int startW, startH;
     int targetW, targetH;
+    int startX, startY; 
+    int startCenterX;
     BOOL isExpanding;
 } WindowAnimation;
 
@@ -313,6 +315,9 @@ inline void WinAnimStart(WindowAnimation* anim, HWND hWnd, BOOL expanding,
     anim->isExpanding = expanding;
     anim->startW = rc.right - rc.left;
     anim->startH = rc.bottom - rc.top;
+    anim->startX = rc.left;
+    anim->startY = rc.top;
+    anim->startCenterX = rc.left + (anim->startW / 2);   // 计算中心点
     if (expanding) {
         anim->targetW = targetExpandedW; anim->targetH = targetExpandedH;
     }
@@ -327,11 +332,17 @@ inline BOOL WinAnimUpdate(WindowAnimation* anim, HWND hWnd, int screenW, int mar
     DWORD now = GetTickCount();
     float elapsed = (float)(now - anim->startTime);
     float t = elapsed / durationMs;
-    if (t >= 1.0f) { t = 1.0f; anim->isActive = FALSE; }
+    if (t >= 1.0f) {
+        t = 1.0f;
+        anim->isActive = FALSE;
+        // 不要重置 startTime，让调用方处理最终状态
+        // anim->startTime = 0;
+    }
     float easedT = EaseOutQuad(t);
     int currentW = Lerp(anim->startW, anim->targetW, easedT);
     int currentH = Lerp(anim->startH, anim->targetH, easedT);
-    int x = (screenW - currentW) / 2;
-    SetWindowPos(hWnd, HWND_TOPMOST, x, marginTop, currentW, currentH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    int newX = anim->startCenterX - (currentW / 2);
+    SetWindowPos(hWnd, HWND_TOPMOST, newX, anim->startY,
+        currentW, currentH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     return anim->isActive;
 }
